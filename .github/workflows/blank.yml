@@ -1,0 +1,145 @@
+name: Complete workflow_dispatch showcase
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      # ── string ────────────────────────────────────────────
+      app_name:
+        description: "Application name to deploy"
+        required: true
+        type: string
+        default: "my-app"
+
+      # ── choice ────────────────────────────────────────────
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        default: "staging"
+        options:
+          - dev
+          - staging
+          - prod
+
+      # ── boolean ───────────────────────────────────────────
+      run_tests:
+        description: "Run test suite before deploy"
+        required: false
+        type: boolean
+        default: true
+
+      # ── number ────────────────────────────────────────────
+      replicas:
+        description: "Number of replicas to deploy"
+        required: false
+        type: number
+        default: 2
+
+      # ── environment (uses repo environments) ──────────────
+      deploy_env:
+        description: "GitHub environment for secrets/protection rules"
+        required: false
+        type: environment
+
+env:
+  # Workflow-level env vars — available to ALL jobs
+  APP_NAME: ${{ inputs.app_name }}
+  NODE_ENV: ${{ inputs.environment }}
+  REGISTRY: ghcr.io
+
+jobs:
+
+  # ── Job 1: validate ───────────────────────────────────
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      should_deploy: ${{ steps.check.outputs.ok }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image tag
+        id: tag
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "tag=${{ inputs.environment }}-${SHA}" >> $GITHUB_OUTPUT
+
+      - name: Check deployment gate
+        id: check
+        run: |
+          if [[ "${{ inputs.environment }}" == "prod" && \
+                "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "::error::Prod deploy only allowed from main branch"
+            exit 1
+          fi
+          echo "ok=true" >> $GITHUB_OUTPUT
+
+  # ── Job 2: test (conditional) ─────────────────────────
+  test:
+    name: Run tests
+    needs: validate
+    # Only runs when run_tests boolean is true
+    if: inputs.run_tests == true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+        os: [ubuntu-latest, windows-latest]
+        exclude:
+          # Skip Node 18 on Windows
+          - os: windows-latest
+            node: 18
+        include:
+          # Extra combination: Node 22 on macOS
+          - os: macos-latest
+            node: 22
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci && npm test
+
+  # ── Job 3: deploy (uses environment + secrets) ────────
+  deploy:
+    name: Deploy ${{ inputs.app_name }} → ${{ inputs.environment }}
+    needs: [validate, test]
+    # Always run deploy even if test was skipped
+    if: always() && needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    # GitHub environment — gates on protection rules & supplies secrets
+    environment:
+      name: ${{ inputs.deploy_env || inputs.environment }}
+      url: https://${{ inputs.environment }}.myapp.com
+    concurrency:
+      # Prevent simultaneous deploys to the same env
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy
+        env:
+          # secrets.* must be passed explicitly into steps
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          IMAGE_TAG: ${{ needs.validate.outputs.image_tag }}
+          REPLICAS: ${{ inputs.replicas }}
+        run: |
+          echo "Deploying ${IMAGE_TAG} with ${REPLICAS} replicas"
+          ./scripts/deploy.sh --env ${{ inputs.environment }}
+
+      - name: Write job summary
+        run: |
+          echo "## Deployment summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| App | ${{ inputs.app_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Env | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ needs.validate.outputs.image_tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Replicas | ${{ inputs.replicas }} |" >> $GITHUB_STEP_SUMMARY
