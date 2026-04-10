@@ -1,0 +1,86 @@
+name: Repository dispatch receiver
+
+on:
+  repository_dispatch:
+    # Filter to only specific event types.
+    # Omit 'types' entirely to accept ALL dispatch events.
+    types:
+      - deploy
+      - smoke-test
+      - rollback
+
+jobs:
+
+  handle:
+    name: Handle ${{ github.event.action }}
+    runs-on: ubuntu-latest
+    steps:
+
+      # ── Inspect the full event ────────────────────────────
+      - name: Dump event context
+        run: |
+          echo "Event type : ${{ github.event.action }}"
+          echo "Full payload:"
+          cat $GITHUB_EVENT_PATH
+
+      # ── Access client_payload fields ──────────────────────
+      # client_payload is whatever JSON the caller sent.
+      # Access any field with github.event.client_payload.*
+      - name: Read payload
+        run: |
+          echo "App     : ${{ github.event.client_payload.app }}"
+          echo "Version : ${{ github.event.client_payload.version }}"
+          echo "Env     : ${{ github.event.client_payload.environment }}"
+          echo "SHA     : ${{ github.event.client_payload.sha }}"
+          echo "Dry run : ${{ github.event.client_payload.dry_run }}"
+
+      # ── Branch on event type ──────────────────────────────
+      - name: Deploy
+        if: github.event.action == 'deploy'
+        run: |
+          ./scripts/deploy.sh \
+            --app     "${{ github.event.client_payload.app }}" \
+            --version "${{ github.event.client_payload.version }}" \
+            --env     "${{ github.event.client_payload.environment }}"
+
+      - name: Smoke test
+        if: github.event.action == 'smoke-test'
+        run: |
+          ./scripts/smoke.sh \
+            --url "${{ github.event.client_payload.target_url }}"
+
+      - name: Rollback
+        if: github.event.action == 'rollback'
+        run: |
+          ./scripts/rollback.sh \
+            --to "${{ github.event.client_payload.stable_version }}"
+
+      # ── Nested payload objects ────────────────────────────
+      # client_payload can be deeply nested JSON.
+      - name: Nested payload access
+        run: |
+          # Payload sent: { "meta": { "triggered_by": "ci", "run_id": 123 } }
+          echo "${{ github.event.client_payload.meta.triggered_by }}"
+          echo "${{ github.event.client_payload.meta.run_id }}"
+
+      # ── fromJSON for arrays / booleans ───────────────────
+      - name: Parse array from payload
+        run: |
+          # Payload: { "services": ["api", "worker", "frontend"] }
+          SERVICES='${{ toJSON(github.event.client_payload.services) }}'
+          echo "Services: $SERVICES"
+
+      # ── Reply back with a deployment status ───────────────
+      - name: Post deployment status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.client_payload.sha,
+              state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
+              context: 'dispatch / deploy',
+              description: 'Triggered via repository_dispatch'
+            })
